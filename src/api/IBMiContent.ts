@@ -485,9 +485,39 @@ export default class IBMiContent {
     }
 
     const usLocalLibrary = this.ibmi.sysNameInAmerican(localLibrary);
-    const singleEntry = filters.filterType !== 'regex' ? singleGenericName(filters.object) : undefined;
+    
+    // Attempt to convert the filter to a single generic name pattern (e.g., "QSYS*" or regex that can be converted)
+    // For regex filters, this tries to convert them to IBM i wildcard patterns for better performance
+    const singleEntry = singleGenericName(filters.object, filters.filterType);
+    
+    // Parse the filter to determine if it's a valid filter or should match everything
     const nameFilter = parseFilter(filters.object, filters.filterType);
-    const objectFilter = filters.object && (nameFilter.noFilter || singleEntry) && filters.object !== `*` ? this.ibmi.upperCaseName(filters.object) : undefined;
+    
+    // Extract wildcard pattern and exactness information from singleEntry
+    // singleEntry can be:
+    // - An object with { wildcard: string, isExact: boolean } for regex patterns converted to wildcards
+    // - A string for simple wildcard patterns (e.g., "QSYS*")
+    // - undefined if no conversion is possible
+    const wildcardInfo = typeof singleEntry === 'object' ? singleEntry : (singleEntry ? { wildcard: singleEntry, isExact: true } : undefined);
+    const wildcardPattern = wildcardInfo?.wildcard;
+    const isExactWildcard = wildcardInfo?.isExact ?? true;
+    
+    // Determine the object filter to use in SQL OBJECT_NAME parameter or LIKE clause
+    // This is used to narrow down results at the database level for better performance
+    // Only set if we have a valid filter (not "*" and either no filter needed or we have a wildcard pattern)
+    const objectFilter = filters.object && (nameFilter.noFilter || wildcardPattern) && filters.object !== `*` ? this.ibmi.upperCaseName(wildcardPattern || filters.object) : undefined;
+
+    // Determine if we need additional regex filtering in the WHERE clause
+    // This is necessary when:
+    // 1. Filter type is 'regex' AND
+    // 2. We have an object filter AND
+    // 3. Either no wildcard pattern was generated OR the wildcard is not an exact match AND
+    // 4. The filter is actually filtering something (not a "match all" filter)
+    //
+    // This dual-filtering approach optimizes performance:
+    // - First, use wildcard in OBJECT_NAME to narrow results at DB level (fast)
+    // - Then, apply precise regex in WHERE clause for exact matching (accurate)
+    const regexFilter = filters.filterType === 'regex' && filters.object && (!wildcardPattern || !isExactWildcard) && !nameFilter.noFilter ? filters.object : undefined;
 
     const type = filters.types && filters.types.length === 1 && filters.types[0] !== '*' ? filters.types[0] : '*ALL';
 
@@ -498,16 +528,43 @@ export default class IBMiContent {
     // SYSTABLES takes the name in CCSID 37 format
     // OBJECT_STATISTICS takes the name in the connection CCSID format
 
-    const sourceFileNameLike = () => objectFilter ? ` and f.NAME ${(objectFilter.includes('*') ? ` like ` : ` = `)} '${this.ibmi.sysNameInAmerican(objectFilter).replace('*', '%')}'` : '';
+    // Generate the WHERE clause for source file filtering in SYSTABLES query
+    // Uses either wildcard pattern (LIKE) or regex pattern (REGEXP_LIKE) depending on what's available
+    const sourceFileNameLike = () => {
+      if (objectFilter) {
+        // Use LIKE for wildcard patterns (convert IBM i * to SQL %)
+        // Use = for exact matches (no wildcards)
+        return ` and f.NAME ${(objectFilter.includes('*') ? ` like ` : ` = `)} '${this.ibmi.sysNameInAmerican(objectFilter).replace('*', '%')}'`;
+      } else if (regexFilter) {
+        // Use REGEXP_LIKE for complex regex patterns that couldn't be converted to wildcards
+        return ` and REGEXP_LIKE(f.NAME, '${regexFilter}', 'i')`;
+      }
+      return '';
+    };
 
+    // Generate the OBJECT_NAME parameter for OBJECT_STATISTICS table function
+    // This parameter accepts IBM i generic names (e.g., "QSYS*") for efficient filtering at the DB level
     const objectName = () => objectFilter ? `, OBJECT_NAME => '${objectFilter}'` : '';
+    
+    // Generate the WHERE clause for additional regex filtering on OBJECT_STATISTICS results
+    // Only used when regex pattern is too complex to be fully represented as a wildcard
+    // This ensures precise matching after the initial wildcard-based filtering
+    const objectWhereClause = () => regexFilter ? ` where REGEXP_LIKE(OBJNAME, '${regexFilter}', 'i')` : '';
 
     let createOBJLIST: string[];
     const usVariants = this.ibmi.variantChars.american;
     const localVariants = this.ibmi.variantChars.local;
     let translateName = false;
+    
+    // Build the SQL query based on what types of objects are being requested
+    // Three scenarios are handled differently for optimal performance:
+    
     if (sourceFilesOnly) {
       //DSPFD only      
+
+      // Scenario 1: Only source files (*SRCPF) are requested
+      // Use QSYS2.SYSTABLES which is optimized for file metadata
+      // This is faster than OBJECT_STATISTICS for source file queries
       createOBJLIST = [
         `with SRCFILES as (`,
         `  select `,
@@ -525,9 +582,14 @@ export default class IBMiContent {
         `SELECT * FROM SRCFILES as f`,
         `where f.LIBRARY = '${usLocalLibrary}'${sourceFileNameLike()}`,
       ];
+      // Flag to indicate that names need character translation from American CCSID
       translateName = true;
     } else if (!withSourceFiles) {
       //DSPOBJD only
+
+      // Scenario 2: Objects are requested but NOT source files
+      // Use OBJECT_STATISTICS table function which provides comprehensive object metadata
+      // This is the most efficient query when source file information is not needed
       createOBJLIST = [
         `select `,
         `  OBJNAME          as NAME,`,
@@ -542,10 +604,16 @@ export default class IBMiContent {
         `  OBJOWNER         as OWNER,`,
         `  OBJDEFINER       as CREATED_BY`,
         `from table(QSYS2.OBJECT_STATISTICS(OBJECT_SCHEMA => '${localLibrary}', OBJTYPELIST => '${type}'${objectName()}))`,
+        objectWhereClause(),
       ];
     }
     else {
       //Both DSPOBJD and DSPFD
+
+      // Scenario 3: Both source files and other objects are requested (*ALL, *FILE, etc.)
+      // Use a combination of SYSTABLES (for source file info) and OBJECT_STATISTICS (for all objects)
+      // Join them to enrich file objects with source file metadata when available
+      // This provides complete information but is more complex than the other two scenarios
       createOBJLIST = [
         `with SRCFILES as (`,
         `  select `,
@@ -556,6 +624,7 @@ export default class IBMiContent {
         `  from QSYS2.SYSTABLES as t`,
         `  where t.FILE_TYPE = 'S'`,
         `), SRCPF as (`,
+        // Translate source file names from American CCSID to local CCSID for proper character matching
         `SELECT replace(replace(replace(NAME, '${usVariants[0]}', '${localVariants[0]}'), '${usVariants[1]}', '${localVariants[1]}'), '${usVariants[2]}', '${localVariants[2]}') NAME, IS_SOURCE, SOURCE_LENGTH FROM SRCFILES as f`,
         `  where f.LIBRARY = '${usLocalLibrary}'${sourceFileNameLike()}`,
         `), OBJD as (`,
@@ -572,12 +641,15 @@ export default class IBMiContent {
         `    OBJOWNER          as OWNER,`,
         `    OBJDEFINER        as CREATED_BY`,
         `  from table(QSYS2.OBJECT_STATISTICS(OBJECT_SCHEMA => '${localLibrary}', OBJTYPELIST => '${type}'${objectName()}))`,
-        `  )`,
+        `  ${objectWhereClause()}`,
+        `)`,
+        // Final SELECT that combines object data with source file metadata
         `select`,
         `  o.NAME,`,
         `  o.TYPE,`,
         `  o.ATTRIBUTE,`,
         `  o.TEXT,`,
+        // Use source file flag from SRCPF if available, otherwise use OBJECT_STATISTICS value
         `  case when s.IS_SOURCE is not null then s.IS_SOURCE else o.IS_SOURCE end as IS_SOURCE,`,
         `  s.SOURCE_LENGTH,`,
         `  o.IASP_NUMBER,`,
@@ -586,6 +658,7 @@ export default class IBMiContent {
         `  o.CHANGED,`,
         `  o.OWNER,`,
         `  o.CREATED_BY`,
+        // Left join ensures all objects are returned, with source file info added when available
         `from OBJD o left join SRCPF s on o.NAME = s.NAME`,
       ];
     }
@@ -611,7 +684,7 @@ export default class IBMiContent {
         || filters.types.includes('*ALL')
         || (filters.types.includes('*SRCPF') && object.sourceFile)
         || filters.types.includes(object.type))
-      .filter(object => objectFilter || nameFilter.test(object.name))
+      .filter(object => objectFilter || regexFilter || nameFilter.test(object.name))
       .sort((a, b) => {
         if (a.library.localeCompare(b.library) != 0) {
           return a.library.localeCompare(b.library)
